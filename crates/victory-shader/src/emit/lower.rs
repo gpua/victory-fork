@@ -10827,6 +10827,22 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
+                // A guest scalar branch has one decision for all 64 lanes. Broadcast it
+                // even if SSA reconstruction computed separate copies in the two halves.
+                let cond = if self.x.st.whole_group && !self.x.st.wide.contains(&b) {
+                    if !matches!(self.exchange, Some((_, false, _))) {
+                        return Err(unsupported(offset, "a group branch without shared wave state"));
+                    }
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let word = self.s.m.cast(c, Cast::ZExt, cond, i32t);
+                    let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[word]);
+                    let (scalar, _) = self.exchange_halves(c, first);
+                    let zero = self.s.m.i32(0);
+                    self.s.m.cmp(c, pred::NE, scalar, zero)
+                } else {
+                    cond
+                };
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];

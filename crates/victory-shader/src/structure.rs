@@ -437,6 +437,8 @@ pub struct Structured {
     /// Blocks whose closing branch the whole wave takes together ([`structure_wide`]): its
     /// `when` is still the lane's own bit; the wave goes by all of them.
     pub wide: HashSet<usize>,
+    /// One guest wave occupies the whole group. All guest branches must agree across host waves.
+    pub(crate) whole_group: bool,
     /// Per block closed by a branch on a lane mask: whether the console takes it when some
     /// lane's `when` holds (`true`) or when every lane's does (`false`).
     pub wave_any: Vec<Option<bool>>,
@@ -839,6 +841,7 @@ impl<'a> Lanes<'a> {
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
+            whole_group: false,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks

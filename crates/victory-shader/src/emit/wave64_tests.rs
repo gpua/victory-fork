@@ -259,6 +259,40 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
 }
 
 #[test]
+fn a_whole_group_agrees_on_scalar_and_mask_branches() {
+    let mut native = program(0xBF88_0000);
+    // If the root constant is five, replace it with forty before the masked reduction.
+    let scalar = [0xBF06_8500u32, 0xBF84_0001, 0xBE80_03A8];
+    native.code.splice(12..12, scalar.into_iter().flat_map(u32::to_le_bytes));
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let initial = structure::structure(&p).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::emit_whole_group(&container, &native, &p, &initial);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = result.unwrap();
+    assert_eq!(wave, Some(32));
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    for (below, expected) in [(5, 0x000f_ffff), (33, 0x0001_ffff), (10, 0x1f)] {
+        let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                constants[u.index as usize] = below;
+            }
+        }
+        let output = host.dispatch(&root, &pipeline, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &[View::RawUav(1)], samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        assert_eq!(output[0][0], expected, "input {below}");
+    }
+}
+
+#[test]
 fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
     for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {
         a_wave_or_inside(skip, name);

@@ -461,6 +461,12 @@ pub fn emit(
                 }
             }
         }
+        if let crate::native::StageIo::Cs(cs) = native.io
+            && cs.threads.into_iter().try_fold(1u32, u32::checked_mul) == Some(64)
+            && let Ok((shader, Some(32))) = emit_whole_group(c, native, p, st)
+        {
+            return Ok(shader);
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -494,6 +500,36 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Keep the original guest control flow when an entire workgroup is one console wave.
+/// Each mask branch votes across both host waves. Scalar branches use the guest scalar value.
+/// Vector operations retain their EXEC guards even when inactive lanes follow the branch.
+fn emit_whole_group(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    initial: &structure::Structured,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let wide = initial.wave_any.iter().enumerate()
+        .filter_map(|(b, vote)| vote.is_some().then_some(b))
+        .collect();
+    let mut st = structure::structure_wide(p, &wide)?;
+    for (b, exit) in st.exits.iter().enumerate() {
+        if let structure::LaneExit::Branch { when, .. } = *exit
+            && !st.wide.contains(&b)
+            && st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_)))
+        {
+            return Err(ShaderError::Unsupported {
+                offset: p.blocks[b].offset,
+                what: "an unknown group branch condition",
+            });
+        }
+    }
+    st.whole_group = true;
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    emit_program(c, native, p, &st, &io, &res)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
