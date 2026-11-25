@@ -308,6 +308,13 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    if native.stage == HwStage::Ps
+        && let Ok(Some(helpers)) = structure::pixel_helpers(p)
+        && let Ok(bindings) = resource::track(p, &native.layout, native.stage, Some(&helpers))
+        && let Ok((shader, _)) = emit_program(c, native, p, &helpers, io, &bindings)
+    {
+        return Ok(shader);
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every

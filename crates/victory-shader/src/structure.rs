@@ -439,6 +439,8 @@ pub struct Structured {
     pub wide: HashSet<usize>,
     /// One guest wave occupies the whole group. All guest branches must agree across host waves.
     pub(crate) whole_group: bool,
+    /// Pixel lanes that discard at a guest instruction and continue as host helper lanes.
+    pub(crate) discards: HashMap<(usize, usize), Bool>,
     /// Per block closed by a branch on a lane mask: whether the console takes it when some
     /// lane's `when` holds (`true`) or when every lane's does (`false`).
     pub wave_any: Vec<Option<bool>>,
@@ -473,6 +475,34 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
+    finish_lanes(l)
+}
+
+/// Keep discarded pixel lanes available to instructions that compute quad derivatives.
+pub(crate) fn pixel_helpers(program: &Program) -> Result<Option<Structured>, ShaderError> {
+    if !program.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i.fields, Fields::Exp { target: 9, done: true, .. })
+    }) {
+        return Ok(None);
+    }
+    let mut l = Lanes::new(program)?;
+    for block in &program.blocks {
+        if let Exit::Branch { taken, not_taken } = block.exit
+            && let Some(last) = block.insts.last()
+            && l.discards(last)
+            && (l.kill_exit(taken) || l.kill_exit(not_taken))
+            && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+        {
+            l.kills.insert(*def);
+        }
+    }
+    if l.kills.is_empty() {
+        return Ok(None);
+    }
+    finish_lanes(l).map(Some)
+}
+
+fn finish_lanes(mut l: Lanes<'_>) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -494,6 +524,7 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
 type Key = (Value, Value);
 
 struct Lanes<'a> {
+    kills: HashSet<(usize, usize)>,
     p: &'a Program,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
@@ -618,6 +649,7 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             wide: HashSet::new(),
             scc_every: HashSet::new(),
+            kills: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
     }
@@ -680,14 +712,44 @@ impl<'a> Lanes<'a> {
                     now = Some(e);
                 }
                 self.step(inst, now);
+                if self.kills.contains(&(b, i))
+                    && let Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } = inst.fields
+                    && let (Some(old), Some(new)) = (
+                        self.key(|r| inst.read(r), code),
+                        self.key(|r| inst.write(r), code),
+                    )
+                {
+                    let m = self.mask(old).0;
+                    self.masks.insert(new, m);
+                    if let Some(scc) = inst.write(Reg::Scc) {
+                        self.scc_lane.insert(scc, m);
+                    }
+                }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
-            if let Exit::Branch { .. } = p.blocks[b].exit
+            if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                let mut w = self.branch(last);
+                // A discard's "no lane is left" exit: no lane takes it (the
+                // live mask keeps every lane, see `kills`).
+                if last
+                    .read(Reg::Scc)
+                    .and_then(|v| self.defs.get(&v))
+                    .is_some_and(|d| self.kills.contains(d))
+                {
+                    if self.kill_exit(taken) {
+                        w = Bool::FALSE;
+                    } else if self.kill_exit(not_taken) {
+                        w = Bool::TRUE;
+                    }
+                }
+                self.when[b] = Some(w);
                 self.wave_any[b] = self.wave_kind(last);
             }
         }
@@ -842,6 +904,11 @@ impl<'a> Lanes<'a> {
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             whole_group: false,
+            discards: self
+                .kills
+                .iter()
+                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
+                .collect(),
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
@@ -1305,6 +1372,53 @@ impl<'a> Lanes<'a> {
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
+    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
+    /// any lane is left in a pixel's live mask after a discard.
+    fn discards(&self, inst: &Inst) -> bool {
+        if !inst.name().starts_with("s_cbranch_scc") {
+            return false;
+        }
+        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
+            return false;
+        };
+        let def = &self.p.blocks[db].insts[di];
+        let Fields::Sop {
+            dst: Some(d), src, ..
+        } = &def.fields
+        else {
+            return false;
+        };
+        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+            && src.first() == Some(d)
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+    }
+
+    /// Whether a lane entering block `b` leaves the program doing nothing but
+    /// scalar work and a `done` export to `null` (a discard's exit).
+    fn kill_exit(&self, mut b: usize) -> bool {
+        for _ in 0..8 {
+            let block = &self.p.blocks[b];
+            let mut null_done = false;
+            for inst in &block.insts {
+                match inst.fields {
+                    Fields::Exp {
+                        target: 9,
+                        done: true,
+                        ..
+                    } => null_done = true,
+                    Fields::Sop { .. } | Fields::Sopp { .. } => {}
+                    _ => return false,
+                }
+            }
+            match block.exit {
+                Exit::End => return null_done,
+                Exit::Jump(next) if !null_done => b = next,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// How the console decides the branch `inst` on a lane mask, in terms of the lanes' own
     /// `when` ([`Self::branch`]): taken when some lane's holds (`true`) or when every lane's
     /// does (`false`). `execnz`/`vccnz` ask for some set bit, `execz`/`vccz` for none; SCC
@@ -1326,6 +1440,7 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
@@ -1530,6 +1645,25 @@ mod tests {
             "{none} {some} {gave_up}"
         );
         assert!(seen.none.len() > 100);
+    }
+
+    #[test]
+    fn a_cutout_pixel_remains_available_to_the_surviving_quad() {
+        let p = build(&[
+            0xBE82_037E, // Save the live pixel mask in s2.
+            0x7D84_0080, // Compare v0 with zero.
+            0xBE80_3C6A, // Restrict EXEC and save the old mask in s0.
+            0x8A02_7E02, // Remove EXEC from the live mask and test the result.
+            0xBF84_0004, // Branch to the final null export if no pixels survive.
+            0xBEFE_0300, // Restore EXEC for the quad.
+            0xF800_180F, 0, S_ENDPGM,
+            0xF800_1890, 0, S_ENDPGM,
+        ], false);
+        assert!(structure(&p).unwrap().discards.is_empty());
+        let helpers = pixel_helpers(&p).unwrap().unwrap();
+        assert_eq!(helpers.discards.len(), 1);
+        assert_ne!(helpers.discards[&(0, 3)], Bool::TRUE);
+        assert_ne!(helpers.discards[&(0, 3)], Bool::FALSE);
     }
 
     #[test]
