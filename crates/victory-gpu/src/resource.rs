@@ -2034,6 +2034,24 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The placed textures asked for with filler words set, as asked
+/// (address and description): for [`PLACED_TWINS`].
+#[cfg(windows)]
+static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Placed textures asked for a second time with other filler words in
+/// their description: each was a second resource and host copy before the
+/// filler was left out of the key ([`texture_at`]).
+#[cfg(windows)]
+static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`PLACED_TWINS`].
+#[cfg(windows)]
+pub(crate) fn placed_filler_twins() -> u64 {
+    PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer
 /// and for a description without a size.
@@ -2051,7 +2069,37 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    // Words 1 and 13 of the description are the filler of its layout
+    // (after the dimension, and at the end): the title leaves there what
+    // its stack held, and two views of one texture that differed only in
+    // them each got a resource and a host copy of their own, on a card
+    // that fills at world entry. They are not part of what a texture is.
+    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let raw = *desc;
+    let mut key = *desc;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    // How many resources the filler alone would have added (a count for
+    // the log: `placed_filler_twins`).
+    if raw != key {
+        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((address, raw)) {
+            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
+                let mut blank = *r;
+                blank[1] = 0;
+                blank[13] = 0;
+                blank == key
+            });
+            if others.count() > 1 {
+                PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -2074,6 +2122,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
         .placed
