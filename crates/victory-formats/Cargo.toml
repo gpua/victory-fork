@@ -7,5 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "offline_bcpack"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

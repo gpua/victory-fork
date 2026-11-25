@@ -147,7 +147,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = matches!(path, "tools/scene_map.py" | "tools/test_scene_map.py")
+    let allowed = matches!(path, "tools/scene_map.py" | "tools/test_scene_map.py" | "tools/nvcomp/prepare_textures.py")
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -196,6 +196,8 @@ mod tests {
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check("tools/scene_map.py", b"import sqlite3\n").is_empty());
+        assert!(check("tools/nvcomp/prepare_textures.py", b"import zlib\n").is_empty());
+        assert!(!check("tools/nvcomp/prepare_textures.py", b"MZ\0").is_empty());
         assert!(!check("tools/scene_map.py", b"MZ\0").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());

@@ -25,6 +25,8 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
+mod texture_store;
+
 use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
@@ -144,7 +146,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { archive: victory_gpu::scene_map::archive(&name, &file), file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { archive: victory_gpu::scene_map::archive(&name, &file), textures: texture_store::Store::open(&name, &file), file });
     put(out, file)
 }
 
@@ -257,6 +259,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
+    textures: Option<texture_store::Store>,
     archive: Option<victory_gpu::scene_map::Archive>,
     file: std::fs::File,
 }
@@ -842,6 +845,18 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             Ok(size)
         })
         .map_err(|hr| fail(hr, "copying"));
+    }
+    if options & MEMORY_SOURCE == 0 {
+        // SAFETY: the queue owns its file reference until this request completes.
+        let file = unsafe { &*request.source.cast::<Instance<File>>() };
+        if let Some(raw) = file.state.textures.as_ref().and_then(|store|
+            store.decode(request.offset, request.source_size, request.destination_size, (options & (ZLIB | BCPACK)) as u32))
+        {
+            return into_destination(request, size, |out| {
+                out.copy_from_slice(&raw);
+                Ok(raw.len())
+            });
+        }
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
