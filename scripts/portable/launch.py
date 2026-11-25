@@ -63,7 +63,7 @@ def prepare_shaders(inputs, game, runtime, env):
         old = json.loads(receipt.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         old = {}
-    if isinstance(old, dict) and old.get("version") == 1 and old.get("inputs") == signature:
+    if isinstance(old, dict) and old.get("version") == 2 and old.get("inputs") == signature:
         actual = shader_outputs(runtime) if (runtime / "shaders").is_dir() else {}
         expected = old.get("outputs")
         if isinstance(expected, dict) and all(actual.get(k) == v for k, v in expected.items()):
@@ -77,10 +77,15 @@ def prepare_shaders(inputs, game, runtime, env):
     print("Compiling and optimizing offline shaders. Log: %s" % log, flush=True)
     with log.open("w", encoding="utf-8") as output:
         targets = inputs if len(subprocess.list2cmdline([str(p) for p in inputs])) < 28000 else [game.parent]
-        for args in (["translate", *flags, *targets], ["optimize-shaders", "--sdk", SDK]):
+        # The driver keys each pipeline by the final shader bytecode.
+        for args in (
+            ["translate", "--cache", *targets],
+            ["optimize-shaders", "--sdk", SDK],
+            ["translate", *flags, *targets],
+        ):
             subprocess.run([EMU, *args], env=env, cwd=runtime.parent, stdout=output,
                            stderr=subprocess.STDOUT, check=True)
-    state = {"version": 1, "inputs": signature, "outputs": shader_outputs(runtime)}
+    state = {"version": 2, "inputs": signature, "outputs": shader_outputs(runtime)}
     temporary = receipt.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
     temporary.replace(receipt)
