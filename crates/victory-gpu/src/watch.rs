@@ -226,6 +226,31 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Record a completed storage write, including writes through a temporary mapping.
+pub fn storage_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+            j.written.insert(page, now);
+        }
+    }
+    crate::descriptor::host::remapped(at, len);
+}
+
+/// Report physical writes at the current title views of the section.
+pub fn storage_section_written(section: usize, offset: u64, len: usize) {
+    if len != 0 {
+        for (at, size) in crate::inplace::views_of_section(section, offset, len) {
+            storage_written(at, size);
+        }
+    }
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -869,6 +894,12 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // A storage write through an alias does not trigger this view's OS write watch.
+        super::storage_written(p + PAGE + 8, 1);
+        let (_, after_storage) = writes(start, end, false).expect("watched after alias write");
+        assert_eq!(after_storage.len(), 1);
+        assert_eq!(after_storage[0].0, p / PAGE + 1);
+        assert!(after_storage[0].1 > now);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(

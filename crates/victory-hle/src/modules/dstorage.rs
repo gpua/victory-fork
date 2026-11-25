@@ -1021,6 +1021,7 @@ fn into_destination(
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let n = fill(out)?;
         record_texture(request, &out[..n]);
+        victory_gpu::storage_written(request.destination as usize, n);
         return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
@@ -1035,6 +1036,7 @@ fn into_destination(
         let out = window.bytes();
         let n = fill(out)?;
         record_texture(request, &out[..n]);
+        window.written(n);
         return Ok(());
     }
     let mut data = vec![0; len];

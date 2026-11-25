@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -118,6 +120,9 @@ impl Shader {
             stage,
             hash: hash.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
+            #[cfg(windows)]
+            resolves_light: stage == "compute"
+                && bytes.windows(crate::ambient::PROGRAM.len()).any(|name| name == crate::ambient::PROGRAM),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }

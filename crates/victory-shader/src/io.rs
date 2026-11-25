@@ -460,7 +460,63 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    first_halves_read(p, &mut io);
     Ok(io)
+}
+
+/// A first half some other instruction reads too (the compiler keeps
+/// P0 + i P10 for more than its second half) evaluates on its own as well.
+fn first_halves_read(p: &Program, io: &mut Io) {
+    if !io
+        .interps
+        .iter()
+        .any(|(_, i)| matches!(i, Interp::Interpolated { .. }))
+    {
+        return;
+    }
+    // What instructions other than second halves read, and through phis.
+    let mut read: std::collections::HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| !i.name().starts_with("v_interp_p2"))
+        .flat_map(|i| i.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = read.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if read.contains(&phi.value) {
+                read.extend(phi.args.iter().copied());
+            }
+        }
+        if read.len() == before {
+            break;
+        }
+    }
+    let mut more = Vec::new();
+    for (_, interp) in &io.interps {
+        let Interp::Interpolated {
+            attribute, first, ..
+        } = interp
+        else {
+            continue;
+        };
+        for &(b, i) in first {
+            let known = |all: &[(Site, Interp)]| all.iter().any(|(s, _)| *s == (b, i));
+            if p.blocks[b].insts[i].writes.iter().any(|w| read.contains(&w.1))
+                && !known(&io.interps)
+                && !known(&more)
+            {
+                more.push((
+                    (b, i),
+                    Interp::Weighted {
+                        attribute: *attribute,
+                    },
+                ));
+            }
+        }
+    }
+    io.interps.extend(more);
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -640,6 +696,25 @@ mod tests {
         pack2: false,
         row2: 1,
     };
+
+    #[test]
+    fn reused_first_interpolation_half_keeps_its_partial_value() {
+        let p = program(&[
+            0xC808_0000, // First half in v2.
+            0x7E06_0302, // Save v2 in v3 before the second half overwrites it.
+            0xC809_0001,
+            0xF800_180F,
+            0x0302_0102, // Export both v2 and v3.
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(io.interps.iter().any(|(site, interp)| {
+            *site == (0, 0) && matches!(interp, Interp::Weighted { .. })
+        }));
+        assert!(io.interps.iter().any(|(site, interp)| {
+            *site == (0, 2) && matches!(interp, Interp::Interpolated { .. })
+        }));
+    }
 
     #[test]
     fn interpolation_pairs_and_color_exports() {

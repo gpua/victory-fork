@@ -264,8 +264,8 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+// Screen-space effects can compile while ordinary geometry occupies its workers.
+static QUEUES: [(Mutex<Queue>, Condvar); 2] = [const { (Mutex::new(Queue::new()), Condvar::new()) }; 2];
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -273,41 +273,46 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
-    if !workers() {
+    let screen = p.graphics.as_ref().is_some_and(|g| g.screen_pass());
+    if !workers(screen) {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
         }
         return;
     }
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let (work, available) = &QUEUES[usize::from(screen)];
+    let mut queue = work.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        available.notify_one();
     }
 }
 
-fn next() -> Arc<Pending> {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+fn next(screen: bool) -> Arc<Pending> {
+    let (work, available) = &QUEUES[usize::from(screen)];
+    let mut queue = work.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop() {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
-fn workers() -> bool {
-    static RUNNING: OnceLock<bool> = OnceLock::new();
-    *RUNNING.get_or_init(|| {
+fn workers(screen: bool) -> bool {
+    static RUNNING: [OnceLock<bool>; 2] = [const { OnceLock::new() }; 2];
+    *RUNNING[usize::from(screen)].get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = if screen { 1 } else { workers };
+        let kind = if screen { "screen" } else { "geometry" };
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .name(format!("victory-pipelines-{kind}-{i}"))
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -315,7 +320,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(screen).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {

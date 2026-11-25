@@ -17,7 +17,17 @@ A later view can request more detailed mip levels.
 Set `VICTORY_INDIRECT_MERGE=0` to compare individual host draws. Set `VICTORY_INDIRECT_WINDOW=0` to clamp each request separately.
 Set `VICTORY_CLAMP_SCOPED=0` to test the global barrier path. Buffers that alias guest memory use that path automatically.
 
+VIctory can replace the screen-probe temporal resolve output with constant indirect light when the ray builder is inactive.
+The default keeps the game's resolve output. Set `VICTORY_AMBIENT=0.6` to test Belobug's tint.
+A numeric value of zero writes black indirect light. Direct light and material colors still come from the game.
+
+Pixel shaders use quad reads for neighboring pixels at triangle edges. Shaders that use a partial interpolation can read its first result.
+Screen-space pipelines have a dedicated compilation worker. Completed DirectStorage writes mark the corresponding guest memory ranges for refresh.
+
 ## Credits
+
+- Belobug contributed the screen-probe light fallback, pixel shader fixes, screen-pass scheduling, and streamed-write fixes adapted here.
+  [Radeon fork and original authors](https://github.com/Belobug/VIctory-Belobug-AMD/tree/4cbe9d76cf3c1fdca7f9a8d8364eacc33e7aa597)
 
 - Vitutu's renderer ports provide indirect batching, scoped clamp barriers, incremental descriptor checks, and indexed buffer transfers.
   The indirect batching and clamp changes originated in ZigZagBoi1's ScarlettPort. [victory-perf](https://github.com/vitutu1/victory-perf/commit/b230f2a)

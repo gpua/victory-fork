@@ -566,6 +566,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        victory_gpu::storage_section_written(
+            slice.section.0 as usize,
+            (slice.index * PAGE + within) as u64,
+            k,
+        );
         (within, done) = (0, done + k);
     }
     true
@@ -576,11 +581,20 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy.
 pub(crate) struct PageWindow {
     view: View,
+    slice: Slice,
     within: usize,
     len: usize,
 }
 
 impl PageWindow {
+    pub(crate) fn written(&self, bytes: usize) {
+        victory_gpu::storage_section_written(
+            self.slice.section.0 as usize,
+            (self.slice.index * PAGE + self.within) as u64,
+            bytes,
+        );
+    }
+
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
@@ -598,6 +612,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
+        slice: slice.clone(),
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
