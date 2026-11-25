@@ -50,7 +50,14 @@ fn main() {
     }
     for (name, path) in files {
         let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}"));
-        field(&mut hash, &name, &bytes);
+        // Git can check out identical translator sources with CRLF or LF.
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("rs" | "toml" | "lock") => {
+                let text = std::str::from_utf8(&bytes).expect("UTF-8 build input");
+                field(&mut hash, &name, text.replace("\r\n", "\n").as_bytes());
+            }
+            _ => field(&mut hash, &name, &bytes),
+        }
     }
     println!(
         "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={}",
