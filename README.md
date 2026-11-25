@@ -8,7 +8,21 @@ It can translate shaders and build supported pipelines before the game starts.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Renderer performance
+
+VIctory batches consecutive indirect draws that use the same pipeline, argument buffer, and command state.
+It also checks buffer descriptors incrementally and uploads the mip levels that a placed 2D texture view can sample.
+A later view can request more detailed mip levels.
+
+Set `VICTORY_INDIRECT_MERGE=0` to compare individual host draws. Set `VICTORY_INDIRECT_WINDOW=0` to clamp each request separately.
+Set `VICTORY_CLAMP_SCOPED=0` to test the global barrier path. Buffers that alias guest memory use that path automatically.
+
 ## Credits
+
+- Vitutu's renderer ports provide indirect batching, scoped clamp barriers, incremental descriptor checks, and indexed buffer transfers.
+  The indirect batching and clamp changes originated in ZigZagBoi1's ScarlettPort. [victory-perf](https://github.com/vitutu1/victory-perf/commit/b230f2a)
+- The partial-mip upload path comes from the victory-world-runtime contributors through Vitutu's port.
+  [Upstream change and contributor credits](https://github.com/vitutu1/victory-perf/commit/1412d43)
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime

@@ -38,12 +38,14 @@ pub(crate) struct Staging {
     upload: upload::Upload,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
-    size: u64,
+    total: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    first: u32,
+    size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -589,6 +591,13 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    upload_from(list, resource, texture, 0);
+}
+
+/// [`upload`] of the mips from `first` on, the ones a view shows: of a
+/// placed texture the title may have no memory for the larger ones, and
+/// what lies there is another texture's.
+pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -596,10 +605,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if host_written || !list.first_mip_use(resource as usize, first) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let Some(staging) = staging(resource, texture, first) else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
@@ -637,7 +646,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        staging.size,
+                        staging.total,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -653,7 +662,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
+                SubresourceIndex: staging.subresource(i),
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -685,9 +694,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 impl Staging {
+    fn part(&self, i: usize) -> (u32, u32) {
+        let mips = self.mips - self.first;
+        (self.first + i as u32 % mips, i as u32 / mips)
+    }
+
+    /// The texture's subresource the `i`th part of the staging buffer is.
+    fn subresource(&self, i: usize) -> u32 {
+        let (mip, slice) = self.part(i);
+        slice * self.mips + mip
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
-        (self.memory as usize, self.layout.size as usize)
+        (self.memory as usize, self.size)
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -710,7 +730,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
-        let size = self.layout.size as usize;
+        let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
@@ -872,7 +892,7 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -955,7 +975,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    let size = s.layout.size as usize;
+    let size = s.size;
     Some((size as u64, committed(s.memory, size)))
 }
 
@@ -1128,11 +1148,24 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
-/// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+/// The first mip a staging buffer holds and the bytes of title memory read
+/// for it and the smaller ones, for a texture of `mips` mips a view shows
+/// from `first` on: from `first` only where the layout can end behind the
+/// smaller mips (one 2-D slice: `bytes_from` is the whole layout for any
+/// other), else all of it.
+fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32) -> (u32, usize) {
+    let first = if first < mips && layout.bytes_from(first) < layout.size { first } else { 0 };
+    (first, layout.bytes_from(first) as usize)
+}
+
+/// The staging state of a title texture from mip `first` on, made on first
+/// use (and made anew for larger mips than the one there holds).
+fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    if let Some(s) = map.get(&(resource as usize))
+        && s.first <= first
+    {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -1151,10 +1184,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1163,7 +1197,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            0,
+            first,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1186,7 +1220,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         upload,
         #[cfg(feature = "diagnostics")]
-        size: total,
+        total,
+        size,
+        first,
         footprints,
         rows,
         layout,
@@ -1205,6 +1241,43 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+    fn layout(depth_or_array: u32) -> victory_formats::texture::Layout {
+        let desc = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth_or_array,
+            mips: 9,
+            format: 71,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        };
+        Texture::new(&desc).unwrap().planes[0].layout.clone()
+    }
+
+    /// A view from mip 4 of a 1024x1024 BC1 texture of 9 mips stages mips
+    /// 4 to 8 and reads only the memory they take; a view of all of it, an
+    /// array's view, or a first mip past the chain stage all of it.
+    #[test]
+    fn a_view_of_the_smaller_mips_stages_only_their_memory() {
+        let l = layout(1);
+        assert_eq!(super::staged_part(&l, 9, 4), (4, l.bytes_from(4) as usize));
+        assert!(l.bytes_from(4) < l.size);
+        assert_eq!(super::staged_part(&l, 9, 0), (0, l.size as usize));
+        assert_eq!(super::staged_part(&l, 9, 9), (0, l.size as usize), "past the chain");
+        let array = layout(2);
+        assert_eq!(super::staged_part(&array, 9, 4), (0, array.size as usize), "slices each hold their chain");
+    }
+
+    /// A 2-D view's first mip is its fifth word; other views show all mips.
+    #[test]
+    fn a_2d_view_names_its_first_mip() {
+        assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 4);
+        assert_eq!(crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 0, "an array view");
+        assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]), 15);
+    }
+
 
     #[test]
     fn guarded_texture_ring_displays_the_current_frame_after_alias_writes() {

@@ -1702,7 +1702,7 @@ struct Deferred {
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2005,6 +2005,29 @@ fn late_writes() -> bool {
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
+/// Deduplicate shader-written ranges while preserving command and range order.
+#[derive(Default)]
+struct DeclaredRanges {
+    writes: Vec<Declared>,
+    by_shadow: std::collections::HashMap<u64, (usize, std::collections::HashSet<(usize, usize)>)>,
+}
+
+impl DeclaredRanges {
+    fn extend(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, ranges: impl IntoIterator<Item = (usize, usize)>) {
+        let (index, seen) = self.by_shadow.entry(shadow.id()).or_insert_with(|| {
+            let index = self.writes.len();
+            self.writes.push((shadow.clone(), Vec::new()));
+            (index, Default::default())
+        });
+        let all = &mut self.writes[*index].1;
+        for range in ranges {
+            if seen.insert(range) {
+                all.push(range);
+            }
+        }
+    }
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -2728,23 +2751,16 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    let mut back = DeclaredRanges::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                back.extend(shadow, [range]);
             }
         }
     }
-    back
+    back.writes
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3121,24 +3137,17 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut declared = DeclaredRanges::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
                 {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
+                    declared.extend(shadow, [(*address, *address + *len)]);
                 }
             }
         }
+        let declared = declared.writes;
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3530,22 +3539,13 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = DeclaredRanges::default();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        back.extend(shadow, ranges.iter().copied());
                     }
                 }
-                relay_hand_back(&back);
+                relay_hand_back(&back.writes);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -3934,7 +3934,7 @@ impl Host {
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = DeclaredRanges::default();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -3943,19 +3943,10 @@ impl Host {
                         self.card_back(card, submitted, &mut seen);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        back.extend(shadow, ranges.iter().copied());
                     }
                 }
-                hand_back(&back);
+                hand_back(&back.writes);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -5220,7 +5211,18 @@ impl HostList {
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        self.first_mip_use(key, 0)
+    }
+
+    /// Record the most detailed mip requested on this particular command list.
+    pub(crate) fn first_mip_use(&self, key: usize, first: u32) -> bool {
+        let mut deferred = self.deferred();
+        let previous = deferred.textures.entry(key).or_insert(u32::MAX);
+        if first >= *previous {
+            return false;
+        }
+        *previous = first;
+        true
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -6019,6 +6021,7 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            crate::draw::batch_line();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

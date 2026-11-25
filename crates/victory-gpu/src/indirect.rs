@@ -238,21 +238,46 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// `VICTORY_CLAMP_SCOPED` (on by default, `=0` disables): the wait for earlier
+/// shader writes before a clamp pass is a UAV barrier on the argument buffer
+/// (and the count buffer) only, not on every resource, and there is no global
+/// UAV barrier after the pass (the scratch buffer's transition to
+/// `INDIRECT_ARGUMENT` orders the clamp's output, and the budget word uses
+/// atomics only). Buffers placed over title memory in place (`own == false`)
+/// keep the global wait so aliased buffers stay ordered.
+///
+/// Ported from ZigZagBoi1/ScarlettPort (`runtime/victory`, GPL-3.0-or-later).
+pub(crate) fn clamp_scoped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CLAMP_SCOPED").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("indirect clamps wait on every resource (VICTORY_CLAMP_SCOPED=0)");
+        }
+        on
+    })
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
+/// `own`: `src` and `count` are dedicated buffers, not placed over title
+/// memory that another buffer may alias ([`clamp_scoped`]).
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    own: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let scoped = own && clamp_scoped();
+    let recorded = record_clamp_waits(c, &list.list, &dst, budget, src, count, spec, false, scoped);
+    recorded.then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -269,12 +294,16 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
+    own: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let scoped = own && clamp_scoped();
+    let recorded = record_clamp_waits(c, &list.list, &dst, budget, src, None, spec, true, scoped);
+    recorded.then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,13 +313,28 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_waits(c, l, dst, budget, src, count, spec, false, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
 /// their draws ([`bound_ahead`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_waits(c, l, dst, budget, src, count, spec, ahead, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_waits(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
@@ -299,6 +343,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    scoped: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -356,14 +401,29 @@ fn record_clamp_as(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
-    ];
+    // Build `first` on the stack: at most 2 UAV barriers + 1 transition.
+    let mut first_buf: [std::mem::MaybeUninit<D3D12_RESOURCE_BARRIER>; 3] =
+        [const { std::mem::MaybeUninit::uninit() }; 3];
+    let mut first_len = 0usize;
+    if waits {
+        if scoped {
+            first_buf[first_len].write(uav_barrier_on(src));
+            first_len += 1;
+            if let Some((buf, _)) = count.filter(|(buf, _)| *buf != src) {
+                first_buf[first_len].write(uav_barrier_on(buf));
+                first_len += 1;
+            }
+        } else {
+            first_buf[first_len].write(uav_barrier());
+            first_len += 1;
+        }
+    }
+    first_buf[first_len].write(transition(
+        dst,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    ));
+    first_len += 1;
     let second = [
         uav_barrier(),
         transition(
@@ -372,10 +432,14 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let skip_second = usize::from(!waits || scoped);
     unsafe {
+        // SAFETY: `first_buf[..first_len]` were all initialized above, and
+        // every borrowed `pResource` inside `ManuallyDrop` stays alive through
+        // `ResourceBarrier` without being released.
+        let first = std::slice::from_raw_parts(first_buf.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(), first_len);
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(first);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -386,7 +450,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
     true
 }
@@ -406,6 +470,23 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// A wait for earlier unordered writes to `resource` only.
+fn uav_barrier_on(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            // Borrowed, not owned: the barrier is used while `resource` lives
+            // and its reference is never released (`ManuallyDrop`).
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: copies the interface pointer without AddRef inside
+                // `ManuallyDrop` so no Release follows.
+                pResource: std::mem::ManuallyDrop::new(unsafe { std::mem::transmute_copy(resource) }),
+            }),
+        },
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1176,9 +1257,9 @@ void main() {
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), true).unwrap();
         done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), true).unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -1188,7 +1269,7 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), true).unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -1202,7 +1283,7 @@ void main() {
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), true).unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
@@ -1212,5 +1293,88 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Verifies `record_clamp_waits` with scoped barriers
+    /// orders a preceding compute UAV write into the clamped scratch buffer and
+    /// into `ExecuteIndirect` without emitting any global UAV barrier.
+    #[test]
+    fn warp_scoped_clamp_orders_preceding_uav_write() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    // Dispatch(5, 1, 1) -> 5 worker hits
+    args.Store3(0, uint3(5, 1, 1));
+}
+"#;
+        let writer = compile_cs(&warp.device, WRITER_CS).expect("writer shader must compile");
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(64);
+        let (dst, _, _) = warp.shared_buffer(64);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(64);
+        let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(64);
+        // SAFETY: mappings hold 64 bytes each.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, 64);
+            std::ptr::write_bytes(budget_ptr, 0, 64);
+            std::ptr::write_bytes(hits_ptr, 0, 64);
+        }
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid 1-argument dispatch command signature.
+        unsafe {
+            warp.device
+                .CreateCommandSignature(&sig_desc, None::<&ID3D12RootSignature>, &mut sig)
+                .expect("dispatch signature");
+        }
+        let sig = sig.unwrap();
+
+        // 1. Writer shader writes (5, 1, 1) via UAV into `src`.
+        // SAFETY: live buffers and valid compute pipeline.
+        unsafe {
+            warp.list.SetComputeRootSignature(&writer.root);
+            warp.list.SetPipelineState(&writer.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, src_gpu);
+            warp.list.Dispatch(1, 1, 1);
+        }
+        // 2. Scoped clamp waits ONLY on `src` (no global barrier before or after).
+        assert!(record_clamp_waits(
+            &warp.clamp,
+            &warp.list,
+            &dst,
+            budget_gpu,
+            (&src, 0),
+            None,
+            (2, 12, 1),
+            false,
+            true,
+        ));
+        // 3. ExecuteIndirect runs `worker` with the clamped record.
+        // SAFETY: `dst` is in `INDIRECT_ARGUMENT` and `worker` writes `hits`.
+        unsafe {
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            warp.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+        }
+        done_on(&warp.list, &dst);
+        warp.submit_and_wait();
+        // SAFETY: completed execution; mapping holds 64 bytes.
+        let hits = unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(hits, 5, "scoped clamp must order preceding UAV write into ExecuteIndirect");
     }
 }

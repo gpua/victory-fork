@@ -56,9 +56,10 @@ pub(crate) struct HostHeap {
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
-    /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
+    /// through a table, or [`HostHeap::buffer_slots_bucket`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: Mutex<[std::collections::HashSet<u32>; crate::draw::BUFFER_BUCKETS]>,
+    pub(crate) buffer_cache: Mutex<crate::draw::HeapBufferCache>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -113,7 +114,7 @@ pub(crate) struct Spans {
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -145,13 +146,11 @@ const HEAD: u64 = 4096;
 impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
-    fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
-            return known;
-        }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
-        bytes
+    fn bytes(&mut self, desc: &[u32; 14], first: u32) -> Option<u64> {
+        *self
+            .sizes
+            .entry((*desc, first))
+            .or_insert_with(|| crate::resource::placed_bytes_from(desc, first))
     }
 
     /// The starts of the spans that overlap `[start, end)`, each taken to
@@ -784,7 +783,8 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
+            buffers: Mutex::new(std::array::from_fn(|_| Default::default())),
+            buffer_cache: Mutex::new(crate::draw::HeapBufferCache::new()),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -1162,9 +1162,9 @@ impl HostHeap {
     }
 
     /// The title slots that hold buffer views.
-    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+    pub(crate) fn buffer_slots_bucket(&self, bucket: usize) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        buffers[bucket].iter().copied().collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1210,7 +1210,7 @@ impl HostHeap {
             Some(View::Placed(false, resource, desc))
                 if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
             {
-                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32))
+                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, crate::resource::first_mip(desc)))
             }
             _ => None,
         };
@@ -1218,7 +1218,7 @@ impl HostHeap {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view
-                .and_then(|(resource, start)| Some((start, start.saturating_add(placed.bytes(resource)?))));
+                .and_then(|(resource, start, first)| Some((start, start.saturating_add(placed.bytes(resource, first)?))));
             match span {
                 Some((start, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
@@ -1242,11 +1242,12 @@ impl HostHeap {
         let stride = view.and_then(view_stride);
         self.set_stride(index, stride.unwrap_or(0));
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = &mut buffers[index as usize % crate::draw::BUFFER_BUCKETS];
         let was = if stride.is_some() {
-            buffers.insert(index);
+            bucket.insert(index);
             true
         } else {
-            buffers.remove(&index)
+            bucket.remove(&index)
         };
         if was {
             self.changed

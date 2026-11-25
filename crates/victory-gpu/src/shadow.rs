@@ -2463,8 +2463,12 @@ impl Shadow {
         to - from
     }
 
-    /// Whether shaders read and write this copy in the card's own memory
-    /// ([`cards`]).
+    /// Whether this buffer aliases the title's memory.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// Whether shaders read and write this copy in the card's own memory.
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
     }
