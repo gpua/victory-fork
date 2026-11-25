@@ -334,27 +334,47 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let newest = |&(_, write): &(u32, u64)| std::cmp::Reverse(write);
+        if again.len() >= max {
+            if again.len() > max {
+                again.select_nth_unstable_by_key(max, newest);
+                again.truncate(max);
+            }
+            again.sort_unstable_by_key(newest);
+            return again;
+        }
+        again.sort_unstable_by_key(newest);
+        let remaining = max - again.len();
+        if fresh.len() > remaining {
+            // Only the newest and oldest ends can enter this batch. Partition
+            // away the middle before sorting the selected writes.
+            let recent = remaining.div_ceil(2);
+            let old = remaining / 2;
+            fresh.select_nth_unstable_by_key(recent, newest);
+            if old > 0 {
+                fresh[recent..].select_nth_unstable_by_key(old, |&(_, write)| write);
+            }
+            fresh.truncate(remaining);
+        }
+        fresh.sort_unstable_by_key(newest);
+        let mut order = again;
+        order.reserve(fresh.len());
+        let mut ends = fresh.into_iter();
+        while let Some(recent) = ends.next() {
+            order.push(recent);
+            if let Some(oldest) = ends.next_back() {
+                order.push(oldest);
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -2373,6 +2393,24 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    #[test]
+    fn bounded_texture_batches_match_the_full_priority_order() {
+        let mut queue = TextureQueue::default();
+        for write in 0..157 {
+            let index = write * 71 % 157;
+            queue.written(index, write.into(), if index % 11 == 0 { 20 } else { 0 }, false);
+            if index % 3 == 0 {
+                queue.later(index, queue.writes, 2, 8);
+            }
+        }
+        for frame in [0, 4, 20] {
+            let all = queue.due(frame, usize::MAX);
+            for max in 0..=all.len() + 1 {
+                assert_eq!(queue.due(frame, max), all[..max.min(all.len())]);
+            }
+        }
     }
 
     /// The queue of textures picked by index serves the slots looked at
