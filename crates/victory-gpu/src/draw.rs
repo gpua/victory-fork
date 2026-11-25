@@ -1382,6 +1382,8 @@ impl State {
             span.2 = span.2.max(*to);
         }
         drop(kept);
+        #[cfg(feature = "diagnostics")]
+        let ranges_done = std::time::Instant::now();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1415,7 +1417,20 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        let buffers_done = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        #[cfg(feature = "diagnostics")]
+        tracing::debug!(
+            target: "victory_gpu::bindless",
+            frame,
+            views,
+            buffers = spans.len(),
+            descriptors_us = ranges_done.duration_since(started).as_micros() as u64,
+            buffers_us = buffers_done.duration_since(ranges_done).as_micros() as u64,
+            textures_us = buffers_done.elapsed().as_micros() as u64,
+            "bindless pass"
+        );
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
