@@ -2224,7 +2224,10 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && desc[10..12] == other_desc[10..12]
+                && (resource == other
+                    || crate::resource::placed_texture_key(resource) == crate::resource::placed_texture_key(other))
         }
         _ => false,
     }
@@ -2450,6 +2453,11 @@ mod tests {
         let low = view(texture, 3, 0x1000_0000);
         // more mips of the same texture
         assert!(same_placed_texture(&low, &view(texture, 0, 0x1000_0000)));
+        let mut padded = texture;
+        padded[1] = 0xdead_beef;
+        padded[13] = 0xaaaa_5555;
+        let canonical = crate::resource::placed_texture_key(&texture) == crate::resource::placed_texture_key(&padded);
+        assert_eq!(same_placed_texture(&low, &view(padded, 0, 0x1000_0000)), canonical);
         // another address, another description, a buffer, an unordered view
         assert!(!same_placed_texture(&low, &view(texture, 3, 0x2000_0000)));
         let mut wider = texture;
