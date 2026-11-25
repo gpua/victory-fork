@@ -1415,7 +1415,14 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    static RETAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *RETAIN.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RETAIN").is_some_and(|v| v == "1"))
+        && texture_headroom(video, crate::host::available_physical_ram())
+    {
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(video);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1464,6 +1471,15 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Keep the existing GPU allocation while both local video memory and system RAM have headroom.
+#[cfg(windows)]
+fn texture_headroom(video: Option<[u64; 4]>, ram: Option<u64>) -> bool {
+    const GIB: u64 = 1 << 30;
+    let Some([budget, used, ..]) = video else { return false };
+    ram.is_some_and(|free| free >= 4 * GIB)
+        && budget.saturating_sub(used) > (budget / 4).max(2 * GIB)
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -2446,6 +2462,19 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_retention_requires_both_memory_budgets() {
+        const GIB: u64 = 1 << 30;
+        let room = Some([32 * GIB, 12 * GIB, 0, 0]);
+        assert!(super::texture_headroom(room, Some(4 * GIB)));
+        assert!(!super::texture_headroom(room, Some(4 * GIB - 1)));
+        assert!(!super::texture_headroom(None, Some(8 * GIB)));
+        assert!(!super::texture_headroom(room, None));
+        assert!(!super::texture_headroom(Some([32 * GIB, 24 * GIB, 0, 0]), Some(8 * GIB)));
+        assert!(!super::texture_headroom(Some([4 * GIB, 2 * GIB, 0, 0]), Some(8 * GIB)));
     }
 
     #[test]

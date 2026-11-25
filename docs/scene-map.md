@@ -42,3 +42,8 @@ python tools/scene_map.py --database scene-map.sqlite validate 1 GAME.exe run2.e
 ```
 
 Validation freezes the training run's visual signatures and ranked assets. For each recognized image, it checks requests during the next eight presented frames. It reports hits, predictions, eligible windows, and recognized windows. A global frequency baseline uses the same recognized windows and prediction limit. The report also scores combined scene cues and recent request sequences. It counts first-time requests separately. Use `--frames` with a comma-separated frame list to check particular shots. Each hit counts once per range per window. The mapper does not submit speculative uploads or read game memory to discover player coordinates.
+
+
+## Compare GPU texture retention
+
+Set `VICTORY_TEXTURE_RETAIN=1` to keep idle GPU copies of guest-filled textures when local memory and system RAM have headroom. The emulator uses its ordinary reclaim policy once free local memory reaches 25% of the budget or 2 GiB, whichever is greater. It also uses ordinary reclaim below 4 GiB of free system RAM, or when a budget query fails. Guest releases, alias handling, and command-list lifetimes still apply. The standard setting uses age-based reclamation.
