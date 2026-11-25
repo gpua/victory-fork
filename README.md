@@ -207,6 +207,11 @@ Play uses the regular translation for missing or damaged entries.
 Set `VICTORY_LLVM_SHADERS=0` to compare the same build with regular shaders.
 To prebuild optimized host pipelines, run `translate --cache --pipelines` again with the switch enabled.
 
+The portable Windows package includes a [launcher](scripts/portable/launch.py) and the DXIL compiler.
+Extract it to a writable folder and open `Start-VIctory.cmd`. Select the original game executable.
+The launcher prepares shaders and pipelines in its per-game `cache` folder. Saves live in its `data` subfolder.
+Use `Start-VIctory.cmd --prepare-only` to populate the cache without starting play.
+
 Zettrox's launcher starts manual play without scripted input or frame capture.
 Pass the game path to `scripts/play.ps1 -Game`. Select the AOT executable with `-Exe`.
 The launcher accepts the fork's cache and save directories. [Upstream launcher](https://github.com/Zettrox/ztrx/commit/90b529f878a470fec9bf07b7be316bc769a12232).

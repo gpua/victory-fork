@@ -4,10 +4,10 @@ This Rust fork targets NVIDIA hardware on Windows through Direct3D 12 and requir
 
 ## Offline preparation and launch
 
-- For changes to graphics packs or DirectStorage reads, follow the [pack format and verification rules](tools/nvcomp/README.md). Verify decoded bytes against the source. Preserve the original read path for missing or mismatched requests.
+- DirectStorage reads the original game archives. Test raw, zlib, and BCPack requests when changing that path.
 - For shader changes, test both `translate --cache --pipelines` and `optimize-shaders --sdk`. Use the same `VICTORY_CACHE_DIR` for preparation and play. Preserve the original host shader when LLVM validation fails.
 - The separate portable distribution starts with `Start-VIctory.cmd`. Resolve bundled tools and the per-game `cache` relative to that launcher. The game's `data` folder inside that cache contains saves.
-- Test portable changes after extraction to a new folder. Cover first launch, cache reuse, and repair after removing a generated pack or shader record. Use bundled dependencies for all three tests.
+- Test portable changes after extraction to a new folder. Cover first launch, cache reuse, and repair after removing a cached shader record. Use bundled dependencies for all three tests.
 
 ## Renderer and performance checks
 
@@ -18,4 +18,4 @@ This Rust fork targets NVIDIA hardware on Windows through Direct3D 12 and requir
 
 ## Source and attribution
 
-Keep game files, generated packs, shader caches, captures, and credentials outside tracked source. Use example paths in documentation. Follow the [asset policy](docs/asset-policy.md) for test fixtures. Preserve authorship when importing upstream commits.
+Keep game files, shader caches, captures, and credentials outside tracked source. Use example paths in documentation. Follow the [asset policy](docs/asset-policy.md) for test fixtures. Preserve authorship when importing upstream commits.
