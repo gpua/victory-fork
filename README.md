@@ -183,6 +183,37 @@ Shader entries survive application rebuilds when the translator and its
 inputs stay the same. GPU capabilities and shader settings also affect
 cache reuse. The D3D12 pipeline library depends on the GPU and its driver.
 
+### Offline LLVM optimization
+
+The `aot` profile uses Rust's LLVM backend to optimize the emulator across crates.
+The guest executable still runs its original x86-64 instructions.
+
+After shader warm-up, run the following commands in an x64 Windows SDK developer shell.
+Use the same cache directory for both commands.
+
+```powershell
+cargo build --locked --profile aot -p victory
+$sdk = Split-Path (Get-Command dxc.exe).Source
+$emulator = '.\target\aot\victory.exe'
+& $emulator optimize-shaders --sdk $sdk
+$env:VICTORY_LLVM_SHADERS = '1'
+& $emulator run $exe --execute
+```
+
+The command optimizes translated DXIL with the SDK's LLVM passes.
+It assembles each result and checks it with the SDK validator.
+A separate cache stores accepted shaders by their original host bytecode.
+Play uses the regular translation for missing or damaged entries.
+Set `VICTORY_LLVM_SHADERS=0` to compare the same build with regular shaders.
+To prebuild optimized host pipelines, run `translate --cache --pipelines` again with the switch enabled.
+
+Zettrox's launcher starts manual play without scripted input or frame capture.
+Pass the game path to `scripts/play.ps1 -Game`. Select the AOT executable with `-Exe`.
+The launcher accepts the fork's cache and save directories. [Upstream launcher](https://github.com/Zettrox/ztrx/commit/90b529f878a470fec9bf07b7be316bc769a12232).
+
+The shader cache treats CRLF and LF source files as equivalent.
+This adapts einfachama's cache identity change for xcl. [Upstream change](https://github.com/xcl-dev/xcl/commit/8c1faf1dc35388941a52cb8b8ab768f2637f3560).
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

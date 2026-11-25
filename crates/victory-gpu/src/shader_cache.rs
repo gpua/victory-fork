@@ -13,11 +13,21 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType, ShaderError};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+static LLVM_CACHE: OnceLock<OptimizedShaders> = OnceLock::new();
+static LLVM_HITS: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) -> bool {
+    if std::env::var("VICTORY_LLVM_SHADERS").as_deref() == Ok("1") {
+        match OptimizedShaders::open(&dir) {
+            Ok(cache) => {
+                let _ = LLVM_CACHE.set(cache);
+            }
+            Err(error) => tracing::warn!(%error, "LLVM shader cache unavailable"),
+        }
+    }
     match Cache::open(dir) {
         Ok(cache) => CACHE.set(cache).is_ok(),
         Err(e) => {
@@ -123,7 +133,48 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    result
+    let mut shader = result?;
+    if let Some(bytes) = LLVM_CACHE.get().and_then(|cache| cache.read(&shader.dxil)) {
+        shader.dxil = bytes;
+        let hits = LLVM_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if hits.is_power_of_two() {
+            tracing::info!(hits, "using offline LLVM shaders");
+        }
+    }
+    Ok(shader)
+}
+
+/// An optional second cache keyed by exact host bytecode and optimizer policy.
+/// The game's regular translations remain available as a fallback.
+pub struct OptimizedShaders(Cache);
+
+impl OptimizedShaders {
+    pub fn open(shader_dir: &std::path::Path) -> anyhow::Result<Self> {
+        Cache::open(shader_dir.join("llvm-v1")).map(Self)
+    }
+
+    fn key(input: &[u8]) -> CacheKey {
+        CacheKey::from_parts("llvm.dxil", 1, &[input])
+    }
+
+    pub fn read(&self, input: &[u8]) -> Option<Vec<u8>> {
+        let record = std::fs::read(self.0.path_for(&Self::key(input))).ok()?;
+        let (digest, dxil) = record.split_at_checked(32)?;
+        (dxil.starts_with(b"DXBC") && blake3::hash(dxil).as_bytes() == digest)
+            .then(|| dxil.to_vec())
+    }
+
+    pub fn store(&self, input: &[u8], dxil: &[u8]) -> anyhow::Result<()> {
+        let mut record = blake3::hash(dxil).as_bytes().to_vec();
+        record.extend_from_slice(dxil);
+        self.0.write(&Self::key(input), &record)?;
+        Ok(())
+    }
+}
+
+/// Reads a successful, checksum-verified translation from the regular cache.
+pub fn cached_dxil(record: &[u8]) -> Option<Vec<u8>> {
+    Some(decode_record(record)?.ok()?.dxil)
 }
 
 fn target() -> [u32; 2] {
@@ -454,6 +505,23 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn llvm_cache_checks_the_input_and_output_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OptimizedShaders::open(dir.path()).unwrap();
+        let original = b"DXBC original";
+        let optimized = b"DXBC optimized";
+        cache.store(original, optimized).unwrap();
+        assert_eq!(cache.read(original).as_deref(), Some(optimized.as_slice()));
+        assert_eq!(cache.read(b"DXBC different original"), None);
+
+        let path = cache.0.path_for(&OptimizedShaders::key(original));
+        let mut corrupt = std::fs::read(&path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(path, corrupt).unwrap();
+        assert_eq!(cache.read(original), None);
     }
 
     #[test]

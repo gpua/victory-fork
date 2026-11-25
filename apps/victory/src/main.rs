@@ -6,6 +6,8 @@
 mod census;
 mod inspect;
 #[cfg(windows)]
+mod llvm;
+#[cfg(windows)]
 mod prebuild;
 mod run;
 mod shader;
@@ -95,6 +97,15 @@ enum Command {
         /// Fill the shader cache that `run` reads.
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
+    },
+    /// Optimize cached host shaders ahead of play with a Windows SDK.
+    #[cfg(windows)]
+    OptimizeShaders {
+        /// Directory containing the x64 dxcompiler.dll and dxil.dll.
+        #[arg(long)]
+        sdk: PathBuf,
+        /// Host .dxil files or shader-cache directories. Defaults to the current shader cache.
+        paths: Vec<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -193,6 +204,8 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        #[cfg(windows)]
+        Command::OptimizeShaders { sdk, paths } => llvm::run(&sdk, paths),
         Command::Config => show_config(),
     }
 }
