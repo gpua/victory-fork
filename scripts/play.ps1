@@ -1,15 +1,27 @@
-# ztrx launcher: runs the game for normal play (no scripted presses, no capture).
+# Start a manual play session with the fork's cache and save settings.
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
-    [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
+    [string]$Cache = $env:VICTORY_CACHE_DIR,
+    [string]$Data = $env:VICTORY_DATA_DIR,
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
 )
-foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
-    Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+
+$ErrorActionPreference = "Stop"
+$paths = @{"VICTORY_CACHE_DIR" = $Cache; "VICTORY_DATA_DIR" = $Data}
+$diagnostics = "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS"
+$previous = @{}
+try {
+    foreach ($name in @($paths.Keys) + $diagnostics) {
+        $previous[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        [Environment]::SetEnvironmentVariable($name, $paths[$name], "Process")
+    }
+    & $Exe run $Game --execute
+    $status = $LASTEXITCODE
 }
-New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
-$env:VICTORY_CACHE_DIR = $Cache
-$env:VICTORY_DATA_DIR = $Data
-& $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"
+finally {
+    foreach ($name in $previous.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $previous[$name], "Process")
+    }
+}
+exit $status
