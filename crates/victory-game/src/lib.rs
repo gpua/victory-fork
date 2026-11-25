@@ -26,3 +26,15 @@ pub fn identify(blake3_hex: &str) -> Option<&'static KnownBuild> {
         .iter()
         .find(|b| b.blake3.eq_ignore_ascii_case(blake3_hex))
 }
+
+#[cfg(test)]
+fn compress_fixture(payload: &[u8], window_bits: i32) -> Vec<u8> {
+    let mut buf = vec![0u8; zlib_rs::compress_bound(payload.len())];
+    let config = zlib_rs::DeflateConfig {
+        window_bits,
+        ..zlib_rs::DeflateConfig::new(6)
+    };
+    let (packed, status) = zlib_rs::compress_slice(&mut buf, payload, config);
+    assert_eq!(status, zlib_rs::ReturnCode::Ok);
+    packed.to_vec()
+}

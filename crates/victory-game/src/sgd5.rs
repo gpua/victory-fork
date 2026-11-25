@@ -174,18 +174,25 @@ pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
     out
 }
 
-/// Every record in an SGD5 file, in file order: from the tables, or found
-/// by marker if no table parses.
+/// Read table entries and recover marker-based records in the gaps between databases.
 pub fn records(file: &[u8]) -> Vec<Record<'_>> {
-    let dbs = databases(file);
-    if dbs.is_empty() {
-        return memchr::memmem::find_iter(file, &MARKER)
-            .filter_map(|at| record(file, at))
-            .collect();
+    let mut records = Vec::new();
+    let mut start = 0;
+    for db in databases(file) {
+        records.extend(marker_records(&file[start..db.start], start));
+        records.extend(db.shaders.into_iter().flatten().map(|s| s.record));
+        start = db.end;
     }
-    dbs.into_iter()
-        .flat_map(|db| db.shaders.into_iter().flatten().map(|s| s.record))
-        .collect()
+    records.extend(marker_records(&file[start..], start));
+    records
+}
+
+fn marker_records(bytes: &[u8], start: usize) -> impl Iterator<Item = Record<'_>> {
+    memchr::memmem::find_iter(bytes, &MARKER).filter_map(move |at| {
+        let mut found = record(bytes, at)?;
+        found.offset += start;
+        Some(found)
+    })
 }
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
@@ -427,13 +434,7 @@ mod tests {
     use super::*;
 
     fn record_bytes(name: &str, kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; zlib_rs::compress_bound(payload.len())];
-        let config = zlib_rs::DeflateConfig {
-            window_bits: -15,
-            ..zlib_rs::DeflateConfig::new(6)
-        };
-        let (packed, rc) = zlib_rs::compress_slice(&mut buf, payload, config);
-        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+        let packed = crate::compress_fixture(payload, -15);
         let n = (packed.len() + 12) as u32;
         let mut out = vec![0xF4, 0x01, 0, 0, name.len() as u8 + 1];
         out.extend_from_slice(name.as_bytes());
@@ -441,7 +442,7 @@ mod tests {
         for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        out.extend_from_slice(packed);
+        out.extend_from_slice(&packed);
         out
     }
 
@@ -546,7 +547,7 @@ mod tests {
             u32s(&mut f, &[list.len() as u32]);
             for (i, (name, kind)) in list.iter().enumerate() {
                 let payload = [slot as u8 * 16 + i as u8; 40];
-                let packed = miniz_oxide::deflate::compress_to_vec(&payload, 6);
+                let packed = crate::compress_fixture(&payload, -15);
                 str(&mut f, name);
                 f.push(*kind);
                 let n = packed.len() as u32 + 12;
@@ -638,6 +639,21 @@ mod tests {
         assert_eq!(found.len(), 4);
         assert_eq!(found[3].name, Some("x:CS_c"));
         assert_eq!(found[3].offset, db.shaders[5][0].record.offset);
+    }
+
+    #[test]
+    fn archive_preserves_records_outside_decoded_tables() {
+        let mut archive = record_bytes("VS_before", 0x32, &[1; 64]);
+        archive.extend(database());
+        archive.extend(record_bytes("PS_after", 0x32, &[2; 64]));
+        let found = records(&archive);
+        assert_eq!(found.len(), 6);
+        assert_eq!(found[0].name, Some("VS_before"));
+        assert_eq!(found[5].name, Some("PS_after"));
+        assert!(found.windows(2).all(|r| r[0].offset < r[1].offset));
+        for r in found {
+            assert_eq!(archive[r.offset..r.offset + 4], MARKER);
+        }
     }
 
     #[test]
