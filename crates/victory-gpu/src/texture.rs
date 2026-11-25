@@ -15,6 +15,8 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+mod upload;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -33,11 +35,10 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    upload: upload::Upload,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -565,7 +566,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging.upload.region.buffer.GetGPUVirtualAddress() + staging.upload.region.offset, texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -598,10 +599,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&staging.upload.region.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: staging.upload.region.offset + footprint.Offset,
+                    ..*footprint
+                },
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -815,7 +819,7 @@ impl Staging {
             let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(self.upload.region.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
                 self.layout
@@ -1092,21 +1096,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    // GetCopyableFootprints can omit padding on the final row. The detiler
+    // takes a slice that includes that row's full pitch.
+    let last = footprints.last()?;
+    let padded = u64::from(last.Footprint.RowPitch)
+        .checked_mul(u64::from(*rows.last()?))?
+        .checked_mul(u64::from(last.Footprint.Depth))?;
+    let total = total.max(last.Offset.checked_add(padded)?);
+    let upload = upload::Upload::new(host, total)?;
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
+        upload,
         #[cfg(feature = "diagnostics")]
         size: total,
-        data,
         footprints,
         rows,
         layout,
