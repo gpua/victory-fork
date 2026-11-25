@@ -216,6 +216,10 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+For automated performance runs with production rendering, build with
+`cargo build --release -p victory --features victory-hle/scripted-input`.
+Set `VICTORY_KEYS=18:Enter,40:Enter` to replay the two inputs in the emulator.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

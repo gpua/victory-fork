@@ -48,8 +48,9 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
-# Debugging switches (scripted keys and the like).
-diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+# Replay controller input with the production renderer for timing runs.
+scripted-input = []
+diagnostics = ["scripted-input", "victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
 
 [lints]
 workspace = true
