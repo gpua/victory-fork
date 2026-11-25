@@ -772,22 +772,11 @@ impl Staging {
                 return 0;
             }
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size, frame, guard_clean);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+        // Keep this range mapped through the final in-place read. A remap that
+        // splits a Windows view reserves all pages of the old view.
+        let end = start.saturating_add(size);
+        let Some(_mapped) = waited(2, || crate::watch::read_mapping_range(start, end, !no_wait())) else {
+            return self.refresh_unlocked(last, size, frame, guard_clean);
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

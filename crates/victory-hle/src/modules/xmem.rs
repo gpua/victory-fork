@@ -223,7 +223,7 @@ type FreeRoutine = extern "system" fn(*mut c_void, u64);
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
-/// the `…Default` exports do not.
+/// the `â€¦Default` exports do not.
 fn hooks() -> [usize; 2] {
     static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let at = match AT.get() {
@@ -643,7 +643,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     };
 
     let mut views = views();
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&views, base, len);
     unmap(&mut views, base, len);
     let mut at = base;
     for (slice, count) in mappings {
@@ -694,7 +694,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut views = views();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&views, to, len);
     unmap(&mut views, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -811,6 +811,25 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// Unmapping a subrange temporarily removes its containing Windows views in full.
+fn changing_extent(views: &Views, base: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (base, base);
+    }
+    let end = base.saturating_add(len);
+    let first = views.range(..=base).next_back()
+        .filter(|(at, (size, _))| at.saturating_add(*size) > base)
+        .map_or(base, |(&at, _)| at);
+    let last = views.range(..end).next_back()
+        .map_or(end, |(&at, (size, _))| at.saturating_add(*size).max(end));
+    (first, last)
+}
+
+fn changing(views: &Views, base: usize, len: usize) -> victory_gpu::Remapping {
+    let (first, last) = changing_extent(views, base, len);
+    victory_gpu::title_memory_remapping_range(first, last)
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1126,6 +1145,10 @@ mod tests {
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+
+        let middle = at(a, 1) as usize;
+        assert_eq!(changing_extent(&views(), middle, PAGE), (a as usize, a as usize + 3 * PAGE));
+        assert_eq!(changing_extent(&views(), middle, 0), (middle, middle));
 
         // Unmapping the middle page keeps its neighbours.
         assert_eq!(

@@ -36,7 +36,7 @@ const KERNEL_PAGE: usize = 4096;
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
+    /// Page number â†’ the asking that last found it written.
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
@@ -714,7 +714,7 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
-/// again — and are, the pages noted written, which also has the next check
+/// again â€” and are, the pages noted written, which also has the next check
 /// guard the new view (`protect`).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !view_guard() {
@@ -746,40 +746,78 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-/// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
-
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+struct MappingAccess {
+    readers: Vec<(usize, usize)>,
+    writer: Option<(usize, usize)>,
 }
 
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+static MAPPING: Mutex<MappingAccess> = Mutex::new(MappingAccess { readers: Vec::new(), writer: None });
+static REMAPPER: Mutex<()> = Mutex::new(());
+static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.1 && b.0 < a.1 && a.0 < a.1 && b.0 < b.1
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// Exclusive permission to replace mappings within the announced address range.
+pub struct Remapping {
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        MAPPING.lock().unwrap_or_else(|e| e.into_inner()).writer = None;
+        MAPPING_CHANGED.notify_all();
     }
+}
+
+/// Wait for all in-place readers before a mapping change of unknown extent.
+pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(0, usize::MAX)
+}
+
+/// Protect every address that can temporarily lose its backing during this change.
+pub fn title_memory_remapping_range(start: usize, end: usize) -> Remapping {
+    let exclusive = REMAPPER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut access = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    let range = (start, end);
+    access.writer = Some(range);
+    while access.readers.iter().any(|&r| overlaps(range, r)) {
+        access = MAPPING_CHANGED.wait(access).unwrap_or_else(|e| e.into_inner());
+    }
+    Remapping { _exclusive: exclusive }
+}
+
+/// A range whose mappings stay stable until the reader releases it.
+pub struct Reading((usize, usize));
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut access = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        let at = access.readers.iter().position(|r| *r == self.0).expect("active mapping reader");
+        access.readers.swap_remove(at);
+        if access.writer.is_some_and(|r| overlaps(r, self.0)) {
+            MAPPING_CHANGED.notify_all();
+        }
+    }
+}
+
+/// Hold all mappings stable for a caller that can read anywhere in title memory.
+pub fn title_memory_reading() -> Reading {
+    read_mapping_range(0, usize::MAX, true).expect("blocking mapping read")
+}
+
+pub(crate) fn read_mapping_range(start: usize, end: usize, wait: bool) -> Option<Reading> {
+    let range = (start, end);
+    let mut access = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    while access.writer.is_some_and(|w| overlaps(range, w)) {
+        if !wait {
+            return None;
+        }
+        access = MAPPING_CHANGED.wait(access).unwrap_or_else(|e| e.into_inner());
+    }
+    access.readers.push(range);
+    Some(Reading(range))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1368,6 +1406,14 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn unrelated_textures_remain_readable_during_a_remap() {
+        let _writer = super::title_memory_remapping_range(0x10000, 0x30000);
+        assert!(super::read_mapping_range(0, 0x10000, false).is_some());
+        assert!(super::read_mapping_range(0x30000, 0x40000, false).is_some());
+        assert!(super::read_mapping_range(0x2ffff, 0x40000, false).is_none());
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
