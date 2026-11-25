@@ -66,6 +66,33 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Guarded views are checked on first use and while aliased writes keep changing them.
+    hot_until: u64,
+}
+
+fn hot_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| match std::env::var_os("VICTORY_TEXTURE_HOT") {
+        Some(value) if value == "0" => 0,
+        _ => 64,
+    })
+}
+
+impl Last {
+    fn needs_guarded_hash(&mut self, frame: u64, address: usize, guard_clean: bool) -> bool {
+        if self.hot_until == 0 {
+            self.hot_until = frame.saturating_add(hot_frames());
+        }
+        !guard_clean || frame < self.hot_until || frame.wrapping_add((address >> 16) as u64).is_multiple_of(8)
+    }
+
+    fn changed(&mut self, hash: blake3::Hash, frame: u64, guard_clean: bool) -> bool {
+        let changed = self.hash.replace(hash) != Some(hash);
+        if changed && guard_clean {
+            self.hot_until = frame.saturating_add(hot_frames());
+        }
+        changed
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -646,18 +673,19 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // a periodic hash. Check new views and views with recent unobserved
+        // writes at every use: a decoder can write its rotating surfaces
+        // through another mapping. VICTORY_TEXTURE_HOT=0 keeps the old cadence.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let frame = crate::frame::current();
+        let mut guard_clean = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            guard_clean = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if !last.needs_guarded_hash(frame, start, guard_clean) {
                 return 0;
             }
         }
@@ -672,7 +700,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, frame, guard_clean);
             };
             mapped
         } else {
@@ -696,10 +724,9 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if !last.changed(hash, frame, guard_clean) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -718,10 +745,9 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.changed(hash, frame, guard_clean) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -734,10 +760,9 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.changed(hash, frame, guard_clean) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -750,15 +775,14 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, frame: u64, guard_clean: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.changed(hash, frame, guard_clean) {
                 self.detile(read);
             }
             true
@@ -1101,6 +1125,34 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn guarded_texture_ring_displays_the_current_frame_after_alias_writes() {
+        // Three video surfaces written through a different mapping: the watched
+        // virtual addresses remain clean even though their pixels change.
+        let mut ring = [super::Last::default(), super::Last::default(), super::Last::default()];
+        for frame in 1u64..=80 {
+            let slot = frame as usize % ring.len();
+            let texture = &mut ring[slot];
+            let guard_clean = texture.hash.is_some();
+            let bytes = blake3::hash(&frame.to_le_bytes());
+            if texture.needs_guarded_hash(frame, slot << 16, guard_clean) {
+                texture.changed(bytes, frame, guard_clean);
+            }
+            assert_eq!(texture.hash, Some(bytes), "displayed an old surface on frame {frame}");
+        }
+        // The same HUD pixels remain available after this texture stops changing.
+        let still = &mut ring[0];
+        assert!(!still.needs_guarded_hash(151, 0, true));
+        assert!(still.needs_guarded_hash(152, 0, true), "static views still get their periodic check");
+        let unchanged = still.hash.unwrap();
+        assert!(!still.changed(unchanged, 152, true));
+        assert!(!still.needs_guarded_hash(153, 0, true), "reading static HUD pixels keeps the view cold");
+        assert!(still.needs_guarded_hash(153, 0, false), "a write seen by the guard is checked immediately");
+        let resumed = blake3::hash(b"animated again");
+        assert!(still.changed(resumed, 160, true));
+        assert!(still.needs_guarded_hash(161, 0, true), "a late alias write restarts frequent checks");
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
