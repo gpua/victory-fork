@@ -125,6 +125,18 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
+## NVIDIA texture streaming
+
+VIctory packs small texture uploads into aligned regions of persistently mapped D3D12 buffers.
+Command lists retain each region until the GPU completes the submission.
+Set `VICTORY_UPLOAD_POOL=0` to compare dedicated upload buffers.
+
+The renderer spends up to 64 ms per pass on queued bindless textures by default.
+A backlog of at least 1,024 due slots raises the budget to 192 ms.
+One upload can exceed the deadline. Pending slots remain eligible on later frames.
+Set `VICTORY_TEXTURE_STAGE_MS=250` to restore the previous time budget.
+The byte budget still applies. DirectStorage workers can resolve physical pages while the emulator changes virtual mappings.
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, an NVIDIA Direct3D 12 GPU with
