@@ -1240,13 +1240,7 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-        }
+        self.set_stride(index, stride.unwrap_or(0));
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -1261,6 +1255,16 @@ impl HostHeap {
                 .insert(index);
         }
         stale
+    }
+
+    fn set_stride(&self, index: u32, stride: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -1285,14 +1289,18 @@ impl HostHeap {
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make(view, self.cpu(index));
-        if kept.is_none() {
+        if kept.is_some() {
+            self.set_stride(index, view_stride(view).unwrap_or(0));
+        } else {
             null_for(view, self.cpu(index));
+            self.set_stride(index, 0);
         }
         self.keep(index, kept.flatten());
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.set_stride(index, 0);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -1338,12 +1346,14 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
+        self.set_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
+        self.set_stride(index, 0);
         null_buffer_view(self.cpu(index));
         self.keep(index, None);
     }
@@ -1377,12 +1387,14 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
+        self.set_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        self.set_stride(index, 0);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1419,6 +1431,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.set_stride(index, 0);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -2789,6 +2802,33 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn remapped_slots_publish_the_stride_of_the_current_view() {
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let slot = heap.dynamic(1).unwrap();
+        let (_, _, mapped) = heap.strides.as_ref().unwrap();
+        // SAFETY: slot is an allocated index in the mapped stride buffer.
+        let stride = || unsafe { (*mapped as *const u32).add(slot as usize).read_volatile() };
+        let bytes = vec![0u32; 1024];
+        let address = bytes.as_ptr() as u64;
+        crate::shadow::register(address as usize, address, 4096);
+        let mut desc = [0u32; 16];
+        desc[1] = 1;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[6] = 256;
+        desc[7] = 16;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        let resource = [1, 0, 0, 0, 4096, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        heap.make_at(slot, &View::Placed(false, resource, desc));
+        crate::shadow::unregister(address as usize, address);
+        assert_eq!(stride(), 16);
+        heap.raw_at(slot, heap.strides_buffer().unwrap(), 0, 256);
+        assert_eq!(stride(), 1);
+        heap.make_null(slot);
+        assert_eq!(stride(), 0);
     }
 
     #[test]
