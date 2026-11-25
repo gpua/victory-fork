@@ -77,3 +77,9 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Whole-program LLVM optimization for the host emulator.
+[profile.aot]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
