@@ -51,7 +51,7 @@ impl Upload {
                     class: Some(class),
                 });
             }
-            if let Some((buffer, base)) = host.upload_buffer(stride * REGIONS as u64) {
+            if let Some((buffer, base)) = host.texture_upload_buffer(stride * REGIONS as u64) {
                 crate::host::name(&buffer, || {
                     format!("texture upload pool, {stride} byte slots")
                 });
@@ -79,7 +79,7 @@ impl Upload {
                 });
             }
         }
-        let (buffer, data) = host.upload_buffer(bytes)?;
+        let (buffer, data) = host.texture_upload_buffer(bytes)?;
         crate::host::name(&buffer, || {
             format!("dedicated texture upload, {bytes} bytes")
         });
@@ -127,14 +127,13 @@ mod tests {
         };
         let a = Upload::new(host, 777).unwrap();
         let b = Upload::new(host, 777).unwrap();
-        let readback = host.read_back_buffer(2).unwrap();
+        let readback = host.read_back_buffer(778).unwrap();
         let list = host.new_list().unwrap();
         // SAFETY: both leases own 777 mapped bytes and remain alive.
         unsafe {
             assert_ne!(a.region.data, b.region.data);
             a.region.data.write_bytes(0x3a, 777);
             b.region.data.write_bytes(0xd1, 777);
-            assert_eq!(*a.region.data.add(776), 0x3a);
             list.list
                 .CopyBufferRegion(&readback, 0, &a.region.buffer, a.region.offset + 776, 1);
             list.list
@@ -150,10 +149,16 @@ mod tests {
             readback.Unmap(0, None);
             drop(b);
             let c = Upload::new(host, 777).unwrap();
-            assert!(std::slice::from_raw_parts(c.region.data, 777)
-                .iter()
-                .all(|&v| v == 0));
-            assert_eq!(*a.region.data.add(776), 0x3a);
+            let check = host.new_list().unwrap();
+            check.list.CopyBufferRegion(&readback, 0, &c.region.buffer, c.region.offset, 777);
+            check.list.CopyBufferRegion(&readback, 777, &a.region.buffer, a.region.offset + 776, 1);
+            check.close();
+            host.execute(&[&check]);
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), 778);
+            assert!(bytes[..777].iter().all(|&v| v == 0));
+            assert_eq!(bytes[777], 0x3a);
+            readback.Unmap(0, None);
         }
     }
 }

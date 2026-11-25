@@ -47,3 +47,9 @@ Validation freezes the training run's visual signatures and ranked assets. For e
 ## Compare GPU texture retention
 
 Set `VICTORY_TEXTURE_RETAIN=1` to keep idle GPU copies of guest-filled textures when local memory and system RAM have headroom. The emulator uses its ordinary reclaim policy once free local memory reaches 25% of the budget or 2 GiB, whichever is greater. It also uses ordinary reclaim below 4 GiB of free system RAM, or when a budget query fails. Guest releases, alias handling, and command-list lifetimes still apply. The standard setting uses age-based reclamation.
+
+## Direct texture uploads
+
+Set `VICTORY_GPU_TEXTURE_UPLOAD=1` to test CPU writes to GPU-local staging buffers. VIctory checks D3D12 Options16 and the adapter's local memory budget. If allocation or mapping fails, the emulator uses a system-memory upload buffer. The guest keeps its source bytes in RAM. The GPU copies the staged data into the final texture subresource. CPU reads of GPU-written resources still require synchronization.
+
+The log reports `texture staging uses CPU-visible video memory` when the first allocation succeeds. Compare corresponding visible shots. Changes in overall frame time depend on the scene.

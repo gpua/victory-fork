@@ -39,6 +39,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
+    gpu_texture_uploads: bool,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -657,8 +658,14 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        let gpu_texture_uploads = std::env::var_os("VICTORY_GPU_TEXTURE_UPLOAD").is_some_and(|v| v == "1") && {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut options).cast(), size_of_val(&options) as u32).is_ok()
+                && options.GPUUploadHeapSupported.as_bool()
+        };
+        tracing::info!(gpu_texture_uploads, "host D3D12 device ready");
         Ok(Host {
+            gpu_texture_uploads,
             device,
             queue,
             fence,
@@ -5642,11 +5649,30 @@ impl Host {
         }
     }
 
+    /// A write-only texture staging buffer. Supported adapters can place it in CPU-visible VRAM.
+    pub(crate) fn texture_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.gpu_texture_uploads
+            && self.video_memory().is_some_and(|[budget, used, ..]| {
+                budget.saturating_sub(used).saturating_sub(size) > (budget / 4).max(2 << 30)
+            })
+            && let Some(buffer) = self.mapped_upload(size, D3D12_HEAP_TYPE_GPU_UPLOAD)
+        {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| tracing::info!("texture staging uses CPU-visible video memory"));
+            return Some(buffer);
+        }
+        self.upload_buffer(size)
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_upload(size, D3D12_HEAP_TYPE_UPLOAD)
+    }
+
+    fn mapped_upload(&self, size: u64, heap_type: D3D12_HEAP_TYPE) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: heap_type,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -5677,7 +5703,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
+                    let no_reads = D3D12_RANGE { Begin: 0, End: 0 };
+                    let read_range = (heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD).then_some(&raw const no_reads);
+                    b.Map(0, read_range, Some(&mut data))
                 })
         };
         match made {
