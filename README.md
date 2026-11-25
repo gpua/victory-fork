@@ -211,6 +211,9 @@ Zettrox's launcher starts manual play without scripted input or frame capture.
 Pass the game path to `scripts/play.ps1 -Game`. Select the AOT executable with `-Exe`.
 The launcher accepts the fork's cache and save directories. [Upstream launcher](https://github.com/Zettrox/ztrx/commit/90b529f878a470fec9bf07b7be316bc769a12232).
 
+Use `-BoundTextureUploads` to try a 32 MiB texture budget per frame with backlog acceleration disabled.
+This adapts xcl's byte budget to VIctory's existing texture queue. [Zondybtw's xcl change](https://github.com/xcl-dev/xcl/commit/fb9d05910c783ee1999e5d57770ce37728d603fd).
+
 The shader cache treats CRLF and LF source files as equivalent.
 This adapts einfachama's cache identity change for xcl. [Upstream change](https://github.com/xcl-dev/xcl/commit/8c1faf1dc35388941a52cb8b8ab768f2637f3560).
 
