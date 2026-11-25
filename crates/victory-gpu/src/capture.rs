@@ -152,7 +152,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    crate::scene_map::visual_frame(n) || folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -324,6 +324,9 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        if crate::scene_map::visual_frame(frame) {
+            crate::scene_map::picture(frame, f.Width as usize, f.Height as usize, f.RowPitch as usize, bgra, rows);
+        }
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }

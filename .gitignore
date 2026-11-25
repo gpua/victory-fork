@@ -70,6 +70,13 @@
 *.7z
 *.rar
 
+# Local scene maps, trace files and Python bytecode
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.events
+__pycache__/
+
 # Editor / OS noise
 .vs/
 .idea/

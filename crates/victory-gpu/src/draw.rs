@@ -1712,6 +1712,9 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
+                    if crate::scene_map::enabled() {
+                        crate::scene_map::upload(index, print, len);
+                    }
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

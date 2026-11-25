@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { archive: victory_gpu::scene_map::archive(&name, &file), file });
     put(out, file)
 }
 
@@ -257,6 +257,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
+    archive: Option<victory_gpu::scene_map::Archive>,
     file: std::fs::File,
 }
 
@@ -451,6 +452,14 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        if result.is_ok() && victory_gpu::scene_map::enabled() && job.request.options & (MEMORY_SOURCE | BCPACK) == 0 {
+            // SAFETY: the title keeps our file object alive until the queue signals completion.
+            let file = unsafe { &*job.request.source.cast::<Instance<File>>() };
+            let request = &job.request;
+            if let Some(archive) = &file.state.archive {
+                victory_gpu::scene_map::region(archive, request.offset);
+            }
+        }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -991,7 +1000,9 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let n = fill(out)?;
+        record_texture(request, &out[..n]);
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1005,7 +1016,10 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let out = window.bytes();
+        let n = fill(out)?;
+        record_texture(request, &out[..n]);
+        return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1025,6 +1039,7 @@ fn into_destination(
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
     if written {
+        record_texture(request, &data[..n]);
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
@@ -1043,6 +1058,19 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// Identifies a decoded file extent only after its destination write succeeds.
+fn record_texture(request: &Request, bytes: &[u8]) {
+    if !victory_gpu::scene_map::enabled() || request.options & MEMORY_SOURCE != 0 || request.options & BCPACK == 0 {
+        return;
+    }
+    // SAFETY: the queue has not signalled completion of this file request.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() };
+    if let Some(archive) = &file.state.archive {
+        victory_gpu::scene_map::texture(archive, request.offset, request.source_size, request.destination_size,
+            request.options & (ZLIB | BCPACK), request.intermediate_size, bytes);
     }
 }
 

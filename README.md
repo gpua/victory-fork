@@ -220,6 +220,8 @@ For automated performance runs with production rendering, build with
 `cargo build --release -p victory --features victory-hle/scripted-input`.
 Set `VICTORY_KEYS=18:Enter,40:Enter` to replay the two inputs in the emulator.
 
+To collect archive ranges and GPU texture indices across game sessions, use the [scene texture mapper](docs/scene-map.md).
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
