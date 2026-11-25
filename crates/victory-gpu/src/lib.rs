@@ -58,6 +58,12 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Initializes the render device before a title starts to execute.
+#[cfg(windows)]
+pub fn renderer_available() -> bool {
+    host::host().is_some()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

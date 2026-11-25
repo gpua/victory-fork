@@ -5,6 +5,8 @@
 use std::ffi::c_void;
 
 use victory_gpu::device;
+#[cfg(windows)]
+pub use victory_gpu::renderer_available;
 use victory_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};

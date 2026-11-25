@@ -599,7 +599,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(nvidia_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -674,6 +674,45 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// Opens the first compatible NVIDIA device in DXGI performance order.
+fn nvidia_device() -> windows::core::Result<ID3D12Device> {
+    // SAFETY: DXGI supplies the adapter and owns its description. Each device
+    // query writes only to the local output structure.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let preferred = factory.cast::<IDXGIFactory6>().ok();
+        for index in 0.. {
+            let enumerated = match &preferred {
+                Some(f) => f.EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+                None => factory.EnumAdapters1(index),
+            };
+            let adapter: IDXGIAdapter1 = match enumerated {
+                Ok(adapter) => adapter,
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(e),
+            };
+            let desc = adapter.GetDesc1()?;
+            if desc.VendorId != 0x10de || desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let mut output: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut output).is_err() {
+                continue;
+            }
+            let Some(device) = output else { continue };
+            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+            if device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(),
+                size_of_val(&model) as u32).is_err() || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                continue;
+            }
+            let end = desc.Description.iter().position(|&ch| ch == 0).unwrap_or(desc.Description.len());
+            tracing::info!(adapter = %String::from_utf16_lossy(&desc.Description[..end]), "selected NVIDIA D3D12 adapter");
+            return Ok(device);
+        }
+        Err(windows::core::Error::new(DXGI_ERROR_NOT_FOUND, "No NVIDIA hardware adapter supports D3D12 shader model 6.6"))
     }
 }
 

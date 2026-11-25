@@ -106,6 +106,10 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    anyhow::ensure!(
+        victory_hle::modules::d3d12x::renderer_available(),
+        "Cannot initialize the renderer. This fork requires an NVIDIA D3D12 adapter with shader model 6.6. See the device error above."
+    );
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
