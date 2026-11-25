@@ -5808,6 +5808,7 @@ struct Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    profile_frames: bool,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -5822,6 +5823,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            profile_frames: std::env::var_os("VICTORY_PROFILE_FRAMES").is_some_and(|v| v == "1"),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -5844,7 +5846,9 @@ impl Meter {
             self.copy_stats_frames += 1;
         }
         let elapsed = self.since.elapsed();
-        if elapsed < std::time::Duration::from_secs(1) {
+        if elapsed < std::time::Duration::from_secs(1)
+            && !(self.profile_frames && crate::draw::drawn().saturating_sub(self.drawn) >= 350)
+        {
             return;
         }
         let drawn = crate::draw::drawn();
@@ -5866,6 +5870,11 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        if self.profile_frames && frames == 1.0 && draws >= 350.0 {
+            tracing::info!(frame = crate::frame::current(), wall_ms = ms, draws, dropped,
+                submit_cpu_ms = cpu, gpu_wait_ms = gpu, copy_ms, copy_mb, texture_ms, texture_mb,
+                readback_ms = back_ms, readback_mb = back_mb, "heavy present profile");
+        }
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
