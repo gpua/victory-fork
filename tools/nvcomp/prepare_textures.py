@@ -105,7 +105,10 @@ def unpack(item, bcpack):
         raise ValueError("Incomplete source block")
     if options == 1:
         stream = zlib.decompressobj()
-        raw = stream.decompress(data, length + 1)
+        try:
+            raw = stream.decompress(data, length + 1)
+        except zlib.error as error:
+            raise ValueError("Invalid zlib stream at offset %#x, size %d" % (entry[0], size)) from error
         if not stream.eof or len(raw) != length:
             raise ValueError("Unexpected zlib output length")
     else:
@@ -121,7 +124,9 @@ def pack_store(path, folder, codec, workers, bcpack):
     st = path.stat()
     stamp = FILETIME_EPOCH + st.st_mtime_ns // 100
     target = folder / ("%s.%x.%x.vtxz" % (path.name.lower(), st.st_size, stamp))
-    with path.open("rb") as source:
+    # On Windows a mapping can change the underlying file position. Keep the
+    #   index scanner independent of the buffered payload reader.
+    with path.open("rb") as source, path.open("rb") as scanner:
         identity = digest(source.read(4096))
         source.seek(0)
         if target.exists():
@@ -133,7 +138,7 @@ def pack_store(path, folder, codec, workers, bcpack):
                         return 0
             raise ValueError("Existing sidecar failed validation: %s" % target)
         scan = archive_requests if path.suffix.lower() == ".rpf" else requests
-        entries = iter(scan(source, st.st_size))
+        entries = iter(scan(scanner, st.st_size))
         records = bytearray()
         checker = zstandard.ZstdDecompressor()
         with tempfile.NamedTemporaryFile(dir=folder, suffix=".partial", delete=False) as output:
@@ -181,6 +186,8 @@ def main():
     parser.add_argument("game", type=Path)
     parser.add_argument("cache", type=Path)
     parser.add_argument("--bcpack", type=Path, required=True)
+    parser.add_argument("--archive", action="append", default=[], type=Path,
+                        help="Additional RPF9 graphics archive, relative to the game directory or absolute")
     args = parser.parse_args()
     args.cache.mkdir(parents=True, exist_ok=True)
     bcpack = decoder(args.bcpack)
@@ -189,6 +196,12 @@ def main():
     graphics_archive = args.game / "textures.rpf"
     if graphics_archive.is_file():
         paths.append(graphics_archive)
+    for candidate in args.archive:
+        archive = (args.game / candidate).resolve()
+        if archive.suffix.lower() != ".rpf" or not archive.is_file():
+            parser.error("Invalid graphics archive: %s" % candidate)
+        if archive not in paths:
+            paths.append(archive)
     if not paths:
         parser.error("No texture stores or graphics archive found")
     # Windows releases the lock if the preparer exits.

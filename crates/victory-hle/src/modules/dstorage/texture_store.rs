@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const HEADER: u64 = 48;
 const RECORD: usize = 48;
 const MAX_BLOCK: usize = 4 << 20;
-static HITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 struct Entry {
     offset: u64,
@@ -24,6 +23,8 @@ struct Entry {
 pub(super) struct Store {
     file: File,
     entries: Vec<Entry>,
+    name: String,
+    hits: [AtomicU64; 8],
 }
 
 fn read_at(file: &File, mut data: &mut [u8], mut offset: u64) -> io::Result<()> {
@@ -53,7 +54,7 @@ impl Store {
             .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PACKS").map(PathBuf::from))
             .as_ref()?;
         let name = Path::new(name).file_name()?.to_str()?.to_ascii_lowercase();
-        if !name.ends_with(".ttpf") && name != "textures.rpf" {
+        if !name.ends_with(".ttpf") && !name.ends_with(".rpf") {
             return None;
         }
         let meta = source.metadata().ok()?;
@@ -63,14 +64,14 @@ impl Store {
             meta.last_write_time()
         ));
         let file = File::open(path).ok()?;
-        let result = Self::load(file, source, meta.file_size());
+        let result = Self::load(file, source, meta.file_size(), &name);
         if result.is_none() {
             tracing::warn!(%name, "offline texture index rejected");
         }
         result
     }
 
-    fn load(file: File, source: &File, source_size: u64) -> Option<Self> {
+    fn load(file: File, source: &File, source_size: u64, name: &str) -> Option<Self> {
         let mut header = [0u8; HEADER as usize];
         read_at(&file, &mut header, 0).ok()?;
         let count = u64_at(&header, 8);
@@ -119,7 +120,12 @@ impl Store {
             }
             entries.push(e);
         }
-        Some(Self { file, entries })
+        Some(Self {
+            file,
+            entries,
+            name: name.to_owned(),
+            hits: [const { AtomicU64::new(0) }; 8],
+        })
     }
 
     pub(super) fn decode(
@@ -143,9 +149,9 @@ impl Store {
             return None;
         }
         let codec = ((options >> 1) & 7) as usize;
-        let hit = HITS[codec].fetch_add(1, Ordering::Relaxed) + 1;
+        let hit = self.hits[codec].fetch_add(1, Ordering::Relaxed) + 1;
         if hit.is_power_of_two() {
-            tracing::info!(hit, size, options, "offline texture request served");
+            tracing::info!(hit, size, options, archive = %self.name, "offline texture request served");
         }
         Some(raw)
     }
@@ -179,7 +185,7 @@ mod tests {
         let open = |bytes: &[u8]| {
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(bytes).unwrap();
-            Store::load(file, &source, 8192)
+            Store::load(file, &source, 8192, "fixture.rpf")
         };
         let store = open(&data).unwrap();
         assert_eq!(store.decode(256, 32, 4096, 14).unwrap(), raw);
