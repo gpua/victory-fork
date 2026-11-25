@@ -46,7 +46,7 @@ Validation freezes the training run's visual signatures and ranked assets. For e
 
 ## Compare GPU texture retention
 
-Set `VICTORY_TEXTURE_RETAIN=1` to keep idle GPU copies of guest-filled textures when local memory and system RAM have headroom. The emulator uses its ordinary reclaim policy once free local memory reaches 25% of the budget or 2 GiB, whichever is greater. It also uses ordinary reclaim below 4 GiB of free system RAM, or when a budget query fails. Guest releases, alias handling, and command-list lifetimes still apply. The standard setting uses age-based reclamation.
+Set `VICTORY_TEXTURE_RETAIN=1` to keep idle GPU copies of guest-filled textures when local memory and system RAM have headroom. The emulator uses its ordinary reclaim policy once free local memory reaches 25% of the budget or 2 GiB, whichever is greater. It also uses ordinary reclaim below 4 GiB of free system RAM, or when a budget query fails. Guest releases, alias handling, and command-list lifetimes still apply. By default, retention requires a local video memory budget of at least 24 GiB and at least 16 GiB of free system RAM. Set `VICTORY_TEXTURE_RETAIN=0` to reclaim idle textures by age.
 
 ## Direct texture uploads
 
