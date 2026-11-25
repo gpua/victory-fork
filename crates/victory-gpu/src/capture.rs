@@ -365,11 +365,18 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    // Filter before GPU readback when a capture needs only one DXGI format.
+    static FORMATS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    let formats = FORMATS.get_or_init(|| std::env::var("VICTORY_DUMP_TARGET_FORMAT")
+        .unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect());
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if (!formats.is_empty() && !formats.contains(&d.Format.0))
+            || d.SampleDesc.Count > 1
+            || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -428,6 +435,13 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // Preserve the native words and the row pitch for comparison of depth and visibility IDs.
+        if std::env::var_os("VICTORY_DUMP_TARGET_RAW").is_some() && let Some(folder) = folder() {
+            let path = folder.join(format!("frame-{frame}-{resource:?}-{}x{}-f{}-pitch{pitch}.raw", d.Width, d.Height, d.Format.0));
+            if let Err(error) = std::fs::write(&path, rows) {
+                tracing::warn!(%error, ?path, "target readback could not be saved");
+            }
+        }
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -589,6 +603,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
+        // R32G32_UINT visibility targets carry a pair of integer identifiers.
+        17 => (8, Box::new(move |b| [u32_at(b, 0) as f32, u32_at(b, 1) as f32, 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.

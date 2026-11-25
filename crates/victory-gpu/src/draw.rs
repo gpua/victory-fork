@@ -2712,6 +2712,10 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if matches!(kind, DRAW | DISPATCH) && max == 1 && counter.is_none() {
+            list.capture_indirect(&bounded, at, kind, &p.name);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

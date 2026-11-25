@@ -1711,6 +1711,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(feature = "diagnostics")]
+    indirect_captures: Vec<(ID3D12Resource, u64, u32, String)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -2753,6 +2755,18 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    for (buffer, frame, kind, name) in &list.deferred().indirect_captures {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy completed. Dispatch records contain three words, draw records contain at least four.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+                let words = std::slice::from_raw_parts(data.cast::<u32>(), if *kind == 2 { 3 } else { 4 });
+                tracing::info!(frame, kind, name, ?words, "indirect arguments");
+                buffer.Unmap(0, None);
+            }
+        }
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5045,6 +5059,30 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Captures a single bounded draw or dispatch for a selected shader after execution.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_indirect(&self, args: &ID3D12Resource, offset: u64, kind: u32, name: &str) {
+        static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let hashes = FILTER.get_or_init(|| std::env::var("VICTORY_TRACE_INDIRECT_SHADERS")
+            .unwrap_or_default().split(',').map(str::trim)
+            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase).collect());
+        let frame = crate::queue::presented() + 1;
+        if hashes.is_empty() || !crate::capture::listed(frame) || !hashes.iter().any(|h| name.contains(h)) {
+            return;
+        }
+        let size = if kind == 2 { 12 } else { 16 };
+        let Some(buffer) = host().and_then(|h| h.read_back_buffer(size)) else { return };
+        let (indirect, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // SAFETY: this is the scratch record ExecuteIndirect just consumed. Restore its state before reuse.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(args, indirect, copy)]);
+            self.list.CopyBufferRegion(&buffer, 0, args, offset, size);
+            self.list.ResourceBarrier(&[transition(args, copy, indirect)]);
+        }
+        self.deferred().indirect_captures.push((buffer, frame, kind, name.to_owned()));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
