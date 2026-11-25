@@ -1,10 +1,8 @@
-# VIctory fork (work in progress)
+# VIctory for NVIDIA GPUs
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+This fork runs Xbox Series titles on Windows through Direct3D 12. The game
+renderer selects an NVIDIA hardware adapter with Shader Model 6.6 support.
+It can translate shaders and build supported pipelines before the game starts.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -15,14 +13,17 @@ developer or publisher.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  GPL-3.0-or-later. This fork uses the same license.
+- Marvis implemented [offline shader translation](https://github.com/Marvisak/VIctory/commit/c47b5297ec550cc8871e0523e8d64403ccbaea90)
+  and [pipeline precompilation](https://github.com/Marvisak/VIctory/commit/9c58a1c35a384552bde9b4c9b169731f282a15a1).
+  t4l03 adapted both features for this codebase and added persistent cache records
+  and pipeline selection from run history in [PR #282](https://github.com/fxceless/victory-fork/pull/282).
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Status reported by the parent fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
@@ -126,7 +127,7 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+Requirements: Windows 10/11 x64, a CPU with AVX2, an NVIDIA Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
@@ -142,25 +143,33 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-Use the same cache directory and translation settings for warm-up and
-play. Shader entries survive rebuilds outside the translator and its build
-inputs. Changes to the translator or GPU shader capabilities select new
-entries. Unsupported shader results are cached under the same rules.
-`--pipelines` also stores supported pipelines from the shader pack
-in the host D3D12 library, which is specific to the host GPU and driver.
-Add `--used-pipelines` to prebuild only exact pipeline keys requested by
-earlier runs in that cache. The shader warm-up still covers all input files.
+Build the executable before the first warm-up. Set `VICTORY_GAME_DIR` to
+the directory that contains your game. Set `VICTORY_CACHE_DIR` to a
+writable directory outside the checkout. Use the same directory and shader
+settings for warm-up and play.
 
 ```powershell
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+cargo build --locked --release -p victory
+$game = $env:VICTORY_GAME_DIR
+$exe = Join-Path $game 'game_scarlett_master.exe'
+$inputs = @(
+    (Join-Path $game 'shaders.rpf')
+    $exe
+    (Join-Path $game 'XboxBvhBuilder.dll')
+    (Join-Path $game 'amd_fidelityfx_upscaler_xbox.dll')
+)
+.\target\release\victory.exe translate --cache --pipelines @inputs
+.\target\release\victory.exe run $exe --execute
 ```
 
-Run the title:
+For shader translation alone, omit `--pipelines`. To limit the pipeline
+build to keys recorded during earlier runs, add `--used-pipelines`.
+Both modes translate all supported shaders in the supplied files.
+The summary shows how many translations succeeded and how many the translator refused.
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
+Shader entries survive application rebuilds when the translator and its
+inputs stay the same. GPU capabilities and shader settings also affect
+cache reuse. The D3D12 pipeline library depends on the GPU and its driver.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
