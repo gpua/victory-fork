@@ -236,14 +236,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            // The SDK validator expects a separate name offset for each element.
+            let offset = strings.len();
+            strings.extend(e.name.bytes().chain([0]));
+            offset
         } else {
             0
         };
@@ -300,10 +296,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
