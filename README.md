@@ -231,6 +231,18 @@ Play uses the regular translation for missing or damaged entries.
 Set `VICTORY_LLVM_SHADERS=0` to compare the same build with regular shaders.
 To prebuild optimized host pipelines, run `translate --cache --pipelines` again with the switch enabled.
 
+### Build the portable Windows ZIP
+
+Open an x64 MSVC developer prompt at the repository root. Install the Rust toolchain specified in `rust-toolchain.toml`, the Windows SDK, the x64 MSVC redistributables, and Python 3.11 or later.
+
+```powershell
+python scripts/package.py
+```
+
+The script builds the optimized emulator with normal input and writes `out/VIctory-Portable.zip`. It downloads the pinned Python embeddable runtime and verifies its SHA-256 digest. For an offline build, supply the official embedded ZIP with `--python-embed` and prepare the Cargo dependencies in advance. Set `CARGO_NET_OFFLINE=true` for that build.
+
+Use `--dxc-dir` or `--crt-dir` to select installed x64 DLLs if the developer prompt does not expose their directories. Use `--output` to select the ZIP path.
+
 The portable Windows package includes a [launcher](scripts/portable/launch.py) and the DXIL compiler.
 Extract it to a writable folder and open `Start-VIctory.cmd`. Select the original game executable.
 The launcher prepares shaders and pipelines in its per-game `cache` folder. Saves live in its `data` subfolder.
